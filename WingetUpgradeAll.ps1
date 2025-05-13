@@ -56,6 +56,11 @@ function Convert-WingetOutput {
         }
     }
 
+    # If no header is found, return an empty array
+    if ($headerIndex -eq -1) {
+        return $results
+    }
+
     # Process rows after the header
     for ($i = $headerIndex + 2; $i -lt $OutputLines.Length; $i++) {
         $line = $OutputLines[$i]
