@@ -54,7 +54,7 @@
     .\WingetUpgradeAll.ps1 upgrade-all -Source winget -WhatIf
 
 .NOTES
-    Version: 2.0.1
+    Version: 2.0.2
 #>
 #Requires -Version 5.1
 
@@ -255,13 +255,22 @@ function Invoke-Upgrade {
     $wingetArgs += if ($Interactive) { '--interactive' } else { '--silent' }
 
     Write-Host "  Upgrading: $Id"
-    # Send winget's console output to the host so it does not pollute the
-    # function's return value (which must be a single status string).
-    & winget @wingetArgs | Out-Host
+    # Let winget draw directly to the console (correct encoding, in-place
+    # progress). Capturing the process object keeps it out of the function's
+    # return value; -Wait makes ExitCode available.
+    $proc = Start-Process -FilePath 'winget' -ArgumentList $wingetArgs `
+        -NoNewWindow -Wait -PassThru
+    $code = $proc.ExitCode
+
+    # 0x8A15002B: package is already current. Not a failure.
+    if ($code -eq -1978335189) {
+        Write-Host "  Already up to date: $Id"
+        return 'Skipped'
+    }
 
     # winget is a native exe: it signals failure via exit code, not exceptions.
-    if ($LASTEXITCODE -ne 0) {
-        $message = "Failed to upgrade '$Id' (winget exit code $LASTEXITCODE)."
+    if ($code -ne 0) {
+        $message = "Failed to upgrade '$Id' (winget exit code $code)."
         Write-Host "  $message" -ForegroundColor Red
         Write-Log $message
         return 'Failed'

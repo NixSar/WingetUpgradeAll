@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] - 2026-06-09
+
+### Changed
+- During an upgrade, winget now draws its progress directly to the console instead of being piped through PowerShell. This fixes garbled progress output (mojibake) and repeated progress-bar lines, and renders the progress bar in place.
+
+### Fixed
+- A package that is already current (winget exit code `0x8A15002B`) is now reported as "Already up to date" and counted as skipped, instead of being logged as a failure.
+
 ## [2.0.1] - 2026-06-09
 
 ### Fixed
