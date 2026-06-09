@@ -54,7 +54,7 @@
     .\WingetUpgradeAll.ps1 upgrade-all -Source winget -WhatIf
 
 .NOTES
-    Version: 2.0
+    Version: 2.0.1
 #>
 #Requires -Version 5.1
 
@@ -255,7 +255,9 @@ function Invoke-Upgrade {
     $wingetArgs += if ($Interactive) { '--interactive' } else { '--silent' }
 
     Write-Host "  Upgrading: $Id"
-    & winget @wingetArgs
+    # Send winget's console output to the host so it does not pollute the
+    # function's return value (which must be a single status string).
+    & winget @wingetArgs | Out-Host
 
     # winget is a native exe: it signals failure via exit code, not exceptions.
     if ($LASTEXITCODE -ne 0) {

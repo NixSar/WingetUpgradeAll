@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-06-09
+
+### Fixed
+- `upgrade` and `upgrade-all` crashed with "The '++' operator works only on numbers" on the first program. winget's console output was leaking into the upgrade function's return value; it is now routed to the host so the status is a single value.
+
 ## [2.0] - 2026-06-09
 
 ### Added
