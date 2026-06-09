@@ -1,182 +1,386 @@
+<#
+.SYNOPSIS
+    Lists, saves, and bulk-upgrades programs via the Windows Package Manager (winget),
+    with support for a permanent exceptions list.
+
+.DESCRIPTION
+    WingetUpgradeAll.ps1 wraps winget to make unattended bulk upgrades easy.
+
+    Commands:
+      list         Show all upgradeable programs.
+      save         Save upgradeable program IDs to a file, excluding exceptions.
+      upgrade      Upgrade every program listed in a previously saved file.
+      upgrade-all  List live and upgrade everything in one step, excluding exceptions.
+
+    When the Microsoft.WinGet.Client PowerShell module is installed it is used to
+    enumerate upgradeable packages (robust, locale-independent). Otherwise the script
+    falls back to parsing `winget upgrade` text output. Upgrades themselves always run
+    through the winget CLI so failures are detected via the process exit code.
+
+.PARAMETER command
+    Operation to perform: list, save, upgrade, or upgrade-all.
+
+.PARAMETER listPath
+    Path used to save (save) or read (upgrade) the list of program IDs.
+    Defaults to <script dir>\UpgradeablePrograms.txt.
+
+.PARAMETER exceptionsPath
+    Path to a file of program IDs to exclude. One ID per line; blank lines and
+    lines starting with '#' are ignored. Defaults to
+    <script dir>\PermanentUpgradeExceptions.txt.
+
+.PARAMETER logPath
+    Path to the error log. Defaults to <script dir>\WingetUpgradeErrors.log.
+
+.PARAMETER Source
+    Restrict to a single winget source: 'winget' or 'msstore'.
+
+.PARAMETER Interactive
+    Run upgrades interactively instead of silently.
+
+.PARAMETER WhatIf
+    Show what would be upgraded without performing any upgrades.
+
+.EXAMPLE
+    .\WingetUpgradeAll.ps1 list
+
+.EXAMPLE
+    .\WingetUpgradeAll.ps1 save -exceptionsPath .\Exceptions.txt
+
+.EXAMPLE
+    .\WingetUpgradeAll.ps1 upgrade
+
+.EXAMPLE
+    .\WingetUpgradeAll.ps1 upgrade-all -Source winget -WhatIf
+
+.NOTES
+    Version: 2.0
+#>
+#Requires -Version 5.1
+
 param (
-    [ValidateSet("list", "save", "upgrade")]
+    [Parameter(Position = 0)]
+    [ValidateSet("list", "save", "upgrade", "upgrade-all")]
     [string] $command,
-    [string] $listPath = "$PSScriptRoot\UpgradeablePrograms.txt",
-    [string] $exceptionsPath = "$PSScriptRoot\PermanentUpgradeExceptions.txt"
+
+    [string] $listPath       = "$PSScriptRoot\UpgradeablePrograms.txt",
+    [string] $exceptionsPath  = "$PSScriptRoot\PermanentUpgradeExceptions.txt",
+    [string] $logPath         = "$PSScriptRoot\WingetUpgradeErrors.log",
+
+    [ValidateSet("winget", "msstore")]
+    [string] $Source,
+
+    [switch] $Interactive,
+    [switch] $WhatIf
 )
 
-if (-not $command) {
-    Write-Host "Usage:"
-    Write-Host "  .\WingetUpgrade.ps1 command <list|save|upgrade> -listPath <path> -exceptionsPath <path>"
-    Write-Host ""
-    Write-Host "Commands:"
-    Write-Host "  list    - Lists all upgradeable programs."
-    Write-Host "  save    - Saves upgradeable programs to a file, excluding exceptions."
-    Write-Host "  upgrade - Upgrades programs from the saved list, excluding exceptions."
-    Write-Host ""
-    Write-Host "Optional Parameters:"
-    Write-Host "  -listPath         Path to save or read the list of upgradeable programs. Defaults to $PSScriptRoot\\UpgradeablePrograms.txt."
-    Write-Host "  -exceptionsPath   Path to a file containing program IDs to exclude from upgrades. Defaults to $PSScriptRoot\\PermanentUpgradeExceptions.txt."
-    exit
+$script:ExitCode  = 0
+$script:UseModule = $null   # resolved lazily on first use
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+function Write-Log {
+    param ([string] $Message)
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -Path $logPath -Value "$timestamp  $Message"
 }
 
-function Get-WingetUpgrades {
-    # Run the winget upgrade command and capture raw output with UTF-8 encoding
-    Start-Process -FilePath "winget" -ArgumentList "upgrade" -NoNewWindow -Wait -PassThru -RedirectStandardOutput "winget_output.txt"
-    $output = Get-Content -Path "winget_output.txt" -Encoding UTF8
-    Remove-Item -Path "winget_output.txt" -Force
-    return $output
+function Test-WingetInstalled {
+    return [bool] (Get-Command winget -ErrorAction SilentlyContinue)
 }
 
-function Convert-WingetOutput {
+function Test-WinGetModule {
+    # Cache the result so we only probe / import once per run.
+    if ($null -ne $script:UseModule) {
+        return $script:UseModule
+    }
+
+    if (Get-Module -Name Microsoft.WinGet.Client) {
+        $script:UseModule = $true
+        return $true
+    }
+
+    if (Get-Module -ListAvailable -Name Microsoft.WinGet.Client) {
+        Import-Module Microsoft.WinGet.Client -ErrorAction SilentlyContinue
+        $script:UseModule = [bool] (Get-Module -Name Microsoft.WinGet.Client)
+        return $script:UseModule
+    }
+
+    $script:UseModule = $false
+    return $false
+}
+
+function Get-Field {
     param (
-        [string[]] $OutputLines
+        [string] $Line,
+        [int]    $Start,
+        [int]    $End
     )
 
-    $results = @()
+    if ($Start -lt 0 -or $Start -ge $Line.Length) { return '' }
+
+    $len = if ($End -lt 0 -or $End -gt $Line.Length) { $Line.Length - $Start } else { $End - $Start }
+    if ($len -le 0) { return '' }
+
+    return $Line.Substring($Start, $len).Trim()
+}
+
+function ConvertFrom-WingetUpgradeText {
+    param ([string[]] $OutputLines)
+
+    $results     = [System.Collections.Generic.List[object]]::new()
     $headerIndex = -1
-    $columns = @{}
+    $cols        = $null
 
-    # Locate the header line and extract column positions
-    for ($i = 0; $i -lt $OutputLines.Length; $i++) {
-        $line = $OutputLines[$i]
-
-        if ($line -match "Name\s+Id\s+Version\s+Available\s+Source") {
+    # Locate the header line and capture column start positions.
+    for ($i = 0; $i -lt $OutputLines.Count; $i++) {
+        if ($OutputLines[$i] -match 'Name\s+Id\s+Version\s+Available\s+Source') {
+            $line        = $OutputLines[$i]
             $headerIndex = $i
-
-            # Extract column positions based on header
-            $columns = @{
-                NameColumn      = $line.IndexOf("Name")
-                IdColumn        = $line.IndexOf("Id")
-                VersionColumn   = $line.IndexOf("Version")
-                AvailableColumn = $line.IndexOf("Available")
-                SourceColumn    = $line.IndexOf("Source")
+            $cols = [ordered]@{
+                Name      = $line.IndexOf('Name')
+                Id        = $line.IndexOf('Id')
+                Version   = $line.IndexOf('Version')
+                Available = $line.IndexOf('Available')
+                Source    = $line.IndexOf('Source')
             }
             break
         }
     }
 
-    # If no header is found, return an empty array
-    if ($headerIndex -eq -1) {
+    if ($headerIndex -lt 0) {
         return $results
     }
 
-    # Process rows after the header
-    for ($i = $headerIndex + 2; $i -lt $OutputLines.Length; $i++) {
+    # Process rows after the header (header + separator line).
+    for ($i = $headerIndex + 2; $i -lt $OutputLines.Count; $i++) {
         $line = $OutputLines[$i]
 
-        # Stop at summary line
-        if ($line -match '^\d+ upgrades available') {
-            break
-        }
+        if ([string]::IsNullOrWhiteSpace($line))                      { continue }
+        if ($line -match '^\d+\s+upgrade')                            { break }    # "N upgrades available."
+        if ($line -match 'Name\s+Id\s+Version\s+Available\s+Source')  { continue } # repeated header (2nd table)
+        if ($line -match '^[\s\-─—]+$')                     { continue } # separator rule
 
-        # Skip empty lines
-        if ([string]::IsNullOrWhiteSpace($line)) {
-            continue
-        }
+        $id = Get-Field -Line $line -Start $cols.Id -End $cols.Version
 
-        # Extract fields using column positions
-        $results += [PSCustomObject]@{
-            Name      = $line.Substring($columns.NameColumn, $columns.IdColumn - $columns.NameColumn).Trim()
-            Id        = $line.Substring($columns.IdColumn, $columns.VersionColumn - $columns.IdColumn).Trim()
-            Version   = $line.Substring($columns.VersionColumn, $columns.AvailableColumn - $columns.VersionColumn).Trim()
-            Available = $line.Substring($columns.AvailableColumn, $columns.SourceColumn - $columns.AvailableColumn).Trim()
-            Source    = $line.Substring($columns.SourceColumn).Trim()
-        }
+        # Real winget IDs never contain whitespace; this filters prose / banners.
+        if ([string]::IsNullOrWhiteSpace($id) -or $id -match '\s') { continue }
+
+        $results.Add([pscustomobject]@{
+            Name      = Get-Field -Line $line -Start $cols.Name      -End $cols.Id
+            Id        = $id
+            Version   = Get-Field -Line $line -Start $cols.Version   -End $cols.Available
+            Available = Get-Field -Line $line -Start $cols.Available -End $cols.Source
+            Source    = Get-Field -Line $line -Start $cols.Source    -End -1
+        })
     }
 
     return $results
 }
 
-function Get-UpgradeablePrograms {
-    param (
-        [string[]] $OutputLines
-    )
-    
-    Write-Host "Listing upgradeable programs..."
-    $programs = Convert-WingetOutput -OutputLines $OutputLines
-    
-    if ($programs.Count -eq 0) {
-        Write-Host "No upgrades available or unable to capture IDs."
+function Get-WingetUpgradeText {
+    # Capture `winget upgrade` output to a private temp file (avoids CWD clutter
+    # and name collisions between concurrent runs).
+    $tempFile = Join-Path $env:TEMP "winget_upgrade_$PID.txt"
+    try {
+        $null = Start-Process -FilePath 'winget' `
+            -ArgumentList 'upgrade', '--include-unknown' `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $tempFile
+        return Get-Content -Path $tempFile -Encoding UTF8
     }
-    else {
-        $programs | ForEach-Object { 
-            Write-Host "Program: $($_.Name), ID: $($_.Id)" 
+    finally {
+        if (Test-Path $tempFile) {
+            Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
         }
     }
-    
-    return $programs
 }
 
-function Save-UpgradeablePrograms {
-    param (
-        [string[]] $OutputLines,
-        [string] $FilePath,
-        [string[]] $Exceptions
-    )
-    
-    Write-Host "Saving upgradeable programs to $FilePath..."
-    $programs = Convert-WingetOutput -OutputLines $OutputLines
+function Get-UpgradeableItems {
+    param ([string] $Source)
 
-    if ($programs.Count -eq 0) {
-        Write-Host "No upgrades available or unable to capture IDs."
-    }
-    else {
-        $programs | Where-Object { $_.Id -notin $Exceptions } | ForEach-Object {
-            Write-Host "Saving Program: $($_.Name), ID: $($_.Id)"
-            $_.Id
-        } | Out-File -FilePath $FilePath
-        Write-Host "Upgradeable programs saved to $FilePath"
-    }
-}
-
-function Invoke-FromSavedList {
-    param (
-        [string] $FilePath,
-        [string[]] $Exceptions
-    )
-    
-    if (Test-Path $FilePath) {
-        Write-Host "Upgrading programs from saved list at $FilePath..."
-        Get-Content -Path $FilePath | Where-Object { $_ -notin $Exceptions } | ForEach-Object {
-            Write-Host "Upgrading Program ID: $_"
-            try {
-                winget upgrade $_
-            }
-            catch {
-                $errorMessage = "Error upgrading Program ID: $_ - $($_.Exception.Message)"
-                Write-Host $errorMessage
-                Add-Content -Path "WingetUpgradeErrors.log" -Value "$(Get-Date): $errorMessage"
+    if (Test-WinGetModule) {
+        $packages = Get-WinGetPackage | Where-Object { $_.IsUpdateAvailable }
+        if ($Source) {
+            $packages = $packages | Where-Object { $_.Source -eq $Source }
+        }
+        return $packages | ForEach-Object {
+            [pscustomobject]@{
+                Name      = $_.Name
+                Id        = $_.Id
+                Version   = $_.InstalledVersion
+                Available = ($_.AvailableVersions | Select-Object -First 1)
+                Source    = $_.Source
             }
         }
     }
-    else {
-        Write-Host "Saved list file not found."
-        Add-Content -Path "WingetUpgradeErrors.log" -Value "$(Get-Date): Saved list file not found at $FilePath."
+
+    # Fallback: parse CLI text output.
+    $items = ConvertFrom-WingetUpgradeText -OutputLines (Get-WingetUpgradeText)
+    if ($Source) {
+        $items = $items | Where-Object { $_.Source -eq $Source }
+    }
+    return $items
+}
+
+function Get-CleanLines {
+    # Read a file, trim each line, drop blanks and '#' comments.
+    param ([string] $Path)
+
+    if (-not (Test-Path $Path)) { return @() }
+
+    return Get-Content -Path $Path -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Trim() } |
+        Where-Object   { $_ -and -not $_.StartsWith('#') }
+}
+
+function Invoke-Upgrade {
+    param (
+        [string] $Id,
+        [switch] $Interactive,
+        [switch] $DryRun
+    )
+
+    if ($DryRun) {
+        Write-Host "  [WhatIf] Would upgrade: $Id"
+        return 'Skipped'
+    }
+
+    $wingetArgs = @(
+        'upgrade', '--id', $Id, '--exact',
+        '--accept-package-agreements', '--accept-source-agreements'
+    )
+    $wingetArgs += if ($Interactive) { '--interactive' } else { '--silent' }
+
+    Write-Host "  Upgrading: $Id"
+    & winget @wingetArgs
+
+    # winget is a native exe: it signals failure via exit code, not exceptions.
+    if ($LASTEXITCODE -ne 0) {
+        $message = "Failed to upgrade '$Id' (winget exit code $LASTEXITCODE)."
+        Write-Host "  $message" -ForegroundColor Red
+        Write-Log $message
+        return 'Failed'
+    }
+
+    return 'Succeeded'
+}
+
+function Invoke-UpgradeSet {
+    param ([string[]] $Ids)
+
+    if (-not $Ids -or @($Ids).Count -eq 0) {
+        Write-Host "Nothing to upgrade."
+        return
+    }
+
+    $tally = @{ Succeeded = 0; Failed = 0; Skipped = 0 }
+
+    foreach ($id in $Ids) {
+        $status = Invoke-Upgrade -Id $id -Interactive:$Interactive -DryRun:$WhatIf
+        $tally[$status]++
+    }
+
+    Write-Host ""
+    Write-Host ("Summary: {0} succeeded, {1} failed, {2} skipped." -f `
+        $tally.Succeeded, $tally.Failed, $tally.Skipped)
+
+    if ($tally.Failed -gt 0) {
+        $script:ExitCode = 1
     }
 }
 
-# Main script execution
+function Show-Usage {
+    Write-Host "Usage:"
+    Write-Host "  .\WingetUpgradeAll.ps1 <list|save|upgrade|upgrade-all> [options]"
+    Write-Host ""
+    Write-Host "Commands:"
+    Write-Host "  list         Lists all upgradeable programs."
+    Write-Host "  save         Saves upgradeable program IDs to a file, excluding exceptions."
+    Write-Host "  upgrade      Upgrades programs from the saved list, excluding exceptions."
+    Write-Host "  upgrade-all  Lists live and upgrades everything, excluding exceptions."
+    Write-Host ""
+    Write-Host "Options:"
+    Write-Host "  -listPath <path>        List file to save/read. Default: $listPath"
+    Write-Host "  -exceptionsPath <path>  Program IDs to exclude.   Default: $exceptionsPath"
+    Write-Host "  -logPath <path>         Error log.                Default: $logPath"
+    Write-Host "  -Source <winget|msstore>  Restrict to one source."
+    Write-Host "  -Interactive            Upgrade interactively instead of silently."
+    Write-Host "  -WhatIf                 Show what would be upgraded without doing it."
+}
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+if (-not $command) {
+    Show-Usage
+    exit 0
+}
+
+if (-not (Test-WingetInstalled)) {
+    Write-Host "winget was not found. Install 'App Installer' from the Microsoft Store and retry." -ForegroundColor Red
+    Write-Log "winget command not found."
+    exit 1
+}
+
 try {
-    $wingetOutput = Get-WingetUpgrades
-    $outputLines = $wingetOutput -split "`r?`n"
-    $exceptions = @()
-    if (Test-Path $exceptionsPath) {
-        $exceptions = Get-Content -Path $exceptionsPath -ErrorAction SilentlyContinue
-    }
+    $exceptions = Get-CleanLines -Path $exceptionsPath
 
     switch ($command) {
-        "list" { Get-UpgradeablePrograms -OutputLines $outputLines }
-        "save" { Save-UpgradeablePrograms -OutputLines $outputLines -FilePath $listPath -Exceptions $exceptions }
-        "upgrade" { Invoke-FromSavedList -FilePath $listPath -Exceptions $exceptions }
-        default { Write-Host "Invalid command provided. Use 'list', 'save', or 'upgrade'." }
+
+        "list" {
+            $items = Get-UpgradeableItems -Source $Source
+            if (-not $items -or @($items).Count -eq 0) {
+                Write-Host "No upgrades available."
+                break
+            }
+            $items | Format-Table Name, Id, Version, Available, Source -AutoSize
+            Write-Host ("{0} upgrade(s) available." -f @($items).Count)
+        }
+
+        "save" {
+            $items  = Get-UpgradeableItems -Source $Source
+            $toSave = @($items | Where-Object { $_.Id -notin $exceptions })
+            if ($toSave.Count -eq 0) {
+                Write-Host "Nothing to save (no upgrades, or all excluded)."
+                break
+            }
+            $toSave | ForEach-Object {
+                Write-Host "Saving: $($_.Name) [$($_.Id)]"
+                $_.Id
+            } | Set-Content -Path $listPath -Encoding UTF8
+            Write-Host ("Saved {0} program ID(s) to {1}" -f $toSave.Count, $listPath)
+        }
+
+        "upgrade" {
+            if (-not (Test-Path $listPath)) {
+                $message = "Saved list file not found at $listPath. Run 'save' first."
+                Write-Host $message
+                Write-Log $message
+                $script:ExitCode = 1
+                break
+            }
+            Write-Host "Upgrading programs from saved list at $listPath..."
+            $ids = @(Get-CleanLines -Path $listPath | Where-Object { $_ -notin $exceptions })
+            Invoke-UpgradeSet -Ids $ids
+        }
+
+        "upgrade-all" {
+            Write-Host "Resolving upgradeable programs..."
+            $items = Get-UpgradeableItems -Source $Source
+            $ids   = @($items | Where-Object { $_.Id -notin $exceptions } | ForEach-Object { $_.Id })
+            Invoke-UpgradeSet -Ids $ids
+        }
     }
 }
 catch {
-    Write-Host "An error occurred: $($_.Exception.Message)"
+    $message = "An error occurred: $($_.Exception.Message)"
+    Write-Host $message -ForegroundColor Red
+    Write-Log $message
+    $script:ExitCode = 1
 }
-finally {
-    if (Test-Path "winget_output.txt") {
-        Remove-Item -Path "winget_output.txt" -Force
-    }
-}
+
+exit $script:ExitCode
