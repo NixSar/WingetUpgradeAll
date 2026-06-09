@@ -54,7 +54,7 @@
     .\WingetUpgradeAll.ps1 upgrade-all -Source winget -WhatIf
 
 .NOTES
-    Version: 2.0.2
+    Version: 2.0.3
 #>
 #Requires -Version 5.1
 
@@ -292,9 +292,9 @@ function Invoke-UpgradeSet {
     foreach ($id in $Ids) {
         $status = Invoke-Upgrade -Id $id -Interactive:$Interactive -DryRun:$WhatIf
         $tally[$status]++
+        Write-Host ""
     }
 
-    Write-Host ""
     Write-Host ("Summary: {0} succeeded, {1} failed, {2} skipped." -f `
         $tally.Succeeded, $tally.Failed, $tally.Skipped)
 

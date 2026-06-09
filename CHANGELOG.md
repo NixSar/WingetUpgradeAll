@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.3] - 2026-06-09
+
+### Changed
+- Blank line after each upgrade for readable output.
+
 ## [2.0.2] - 2026-06-09
 
 ### Changed
