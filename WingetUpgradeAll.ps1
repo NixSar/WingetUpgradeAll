@@ -54,7 +54,7 @@
     .\WingetUpgradeAll.ps1 upgrade-all -Source winget -WhatIf
 
 .NOTES
-    Version: 2.0.3
+    Version: 2.0.4
 #>
 #Requires -Version 5.1
 
@@ -292,6 +292,11 @@ function Invoke-UpgradeSet {
     foreach ($id in $Ids) {
         $status = Invoke-Upgrade -Id $id -Interactive:$Interactive -DryRun:$WhatIf
         $tally[$status]++
+        # winget's progress rendering can leave the cursor mid-line; close
+        # that line first so the separator below is actually blank.
+        try {
+            if ($Host.UI.RawUI.CursorPosition.X -gt 0) { Write-Host "" }
+        } catch {}
         Write-Host ""
     }
 

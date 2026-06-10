@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.4] - 2026-06-10
+
+### Fixed
+- Separator blank line after each upgrade was swallowed when winget left the cursor mid-line; the line is now closed before the separator is written.
+
 ## [2.0.3] - 2026-06-09
 
 ### Changed
