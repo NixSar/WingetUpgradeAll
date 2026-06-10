@@ -54,7 +54,7 @@
     .\WingetUpgradeAll.ps1 upgrade-all -Source winget -WhatIf
 
 .NOTES
-    Version: 2.0.4
+    Version: 2.0.5
 #>
 #Requires -Version 5.1
 
@@ -186,7 +186,7 @@ function Get-WingetUpgradeText {
     $tempFile = Join-Path $env:TEMP "winget_upgrade_$PID.txt"
     try {
         $null = Start-Process -FilePath 'winget' `
-            -ArgumentList 'upgrade', '--include-unknown' `
+            -ArgumentList 'upgrade' `
             -NoNewWindow -Wait `
             -RedirectStandardOutput $tempFile
         return Get-Content -Path $tempFile -Encoding UTF8
@@ -202,7 +202,11 @@ function Get-UpgradeableItems {
     param ([string] $Source)
 
     if (Test-WinGetModule) {
-        $packages = Get-WinGetPackage | Where-Object { $_.IsUpdateAvailable }
+        # Skip packages whose installed version winget cannot determine; they
+        # cannot be meaningfully upgraded (matches `winget upgrade` default).
+        $packages = Get-WinGetPackage | Where-Object {
+            $_.IsUpdateAvailable -and $_.InstalledVersion -and $_.InstalledVersion -ne 'Unknown'
+        }
         if ($Source) {
             $packages = $packages | Where-Object { $_.Source -eq $Source }
         }

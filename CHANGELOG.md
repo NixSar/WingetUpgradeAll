@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.5] - 2026-06-10
+
+### Fixed
+- Packages with undeterminable installed versions are no longer listed or saved; behavior matches plain `winget upgrade` (as in 1.x). Removed the `--include-unknown` flag introduced in 2.0 and applied the equivalent filter to the module path.
+
 ## [2.0.4] - 2026-06-10
 
 ### Fixed
