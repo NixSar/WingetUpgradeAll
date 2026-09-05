@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
     Lists, saves, and bulk-upgrades programs via the Windows Package Manager (winget),
-    with support for a permanent exceptions list.
+    with support for a permanent exceptions list and scope-aware elevation.
 
 .DESCRIPTION
     WingetUpgradeAll.ps1 wraps winget to make unattended bulk upgrades easy.
 
     Commands:
-      list         Show all upgradeable programs.
+      list         Show all upgradeable programs (with install scope).
       save         Save upgradeable program IDs to a file, excluding exceptions.
       upgrade      Upgrade every program listed in a previously saved file.
       upgrade-all  List live and upgrade everything in one step, excluding exceptions.
@@ -17,8 +17,27 @@
     falls back to parsing `winget upgrade` text output. Upgrades themselves always run
     through the winget CLI so failures are detected via the process exit code.
 
+    Scope-aware elevation (2.1):
+      Per-user packages (installed under the user profile, e.g. Electron/Squirrel
+      apps) must NOT be upgraded from an elevated process: their installers then
+      write into the user hive with an elevated token and leave behind
+      Administrators-owned registry keys with wrong permissions, which can break
+      other installers (e.g. MSIX file-type registration).
+
+      The script determines each package's install scope via `winget list --scope`
+      and runs two passes so that every package is upgraded under the right token,
+      whichever kind of terminal it was started from:
+
+        Started elevated:     machine-scope packages upgrade in-process; user-scope
+                              and unknown-scope packages run in ONE de-elevated
+                              child (launched via the desktop shell, no prompt).
+        Started non-elevated: user-scope and unknown-scope packages upgrade
+                              in-process; machine-scope packages run in ONE
+                              elevated child (one UAC prompt per run).
+
 .PARAMETER command
     Operation to perform: list, save, upgrade, or upgrade-all.
+    (_batch is internal: used for the child runs described above.)
 
 .PARAMETER listPath
     Path used to save (save) or read (upgrade) the list of program IDs.
@@ -39,7 +58,13 @@
     Run upgrades interactively instead of silently.
 
 .PARAMETER WhatIf
-    Show what would be upgraded without performing any upgrades.
+    Show what would be upgraded (and in which scope/pass) without performing any upgrades.
+
+.PARAMETER resultPath
+    Internal. Result file written by a child run.
+
+.PARAMETER pidPath
+    Internal. File a child run writes its process ID to on start-up.
 
 .EXAMPLE
     .\WingetUpgradeAll.ps1 list
@@ -54,13 +79,13 @@
     .\WingetUpgradeAll.ps1 upgrade-all -Source winget -WhatIf
 
 .NOTES
-    Version: 2.0.5
+    Version: 2.1.0
 #>
 #Requires -Version 5.1
 
 param (
     [Parameter(Position = 0)]
-    [ValidateSet("list", "save", "upgrade", "upgrade-all")]
+    [ValidateSet("list", "save", "upgrade", "upgrade-all", "_batch")]
     [string] $command,
 
     [string] $listPath       = "$PSScriptRoot\UpgradeablePrograms.txt",
@@ -71,7 +96,11 @@ param (
     [string] $Source,
 
     [switch] $Interactive,
-    [switch] $WhatIf
+    [switch] $WhatIf,
+
+    # Internal (child runs)
+    [string] $resultPath,
+    [string] $pidPath
 )
 
 $script:ExitCode  = 0
@@ -89,6 +118,12 @@ function Write-Log {
 
 function Test-WingetInstalled {
     return [bool] (Get-Command winget -ErrorAction SilentlyContinue)
+}
+
+function Test-Elevated {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Test-WinGetModule {
@@ -127,7 +162,9 @@ function Get-Field {
     return $Line.Substring($Start, $len).Trim()
 }
 
-function ConvertFrom-WingetUpgradeText {
+function ConvertFrom-WingetTableText {
+    # Parses the table printed by `winget upgrade` and `winget list`
+    # (both use the columns Name / Id / Version / Available / Source).
     param ([string[]] $OutputLines)
 
     $results     = [System.Collections.Generic.List[object]]::new()
@@ -180,13 +217,16 @@ function ConvertFrom-WingetUpgradeText {
     return $results
 }
 
-function Get-WingetUpgradeText {
-    # Capture `winget upgrade` output to a private temp file (avoids CWD clutter
-    # and name collisions between concurrent runs).
-    $tempFile = Join-Path $env:TEMP "winget_upgrade_$PID.txt"
+function Get-WingetText {
+    # Run winget with the given arguments and return its stdout lines.
+    # Output goes to a private temp file (avoids CWD clutter and name
+    # collisions between concurrent runs).
+    param ([string[]] $Arguments)
+
+    $tempFile = Join-Path $env:TEMP ("winget_{0}_{1}.txt" -f $PID, [guid]::NewGuid().ToString('N'))
     try {
         $null = Start-Process -FilePath 'winget' `
-            -ArgumentList 'upgrade' `
+            -ArgumentList $Arguments `
             -NoNewWindow -Wait `
             -RedirectStandardOutput $tempFile
         return Get-Content -Path $tempFile -Encoding UTF8
@@ -222,11 +262,40 @@ function Get-UpgradeableItems {
     }
 
     # Fallback: parse CLI text output.
-    $items = ConvertFrom-WingetUpgradeText -OutputLines (Get-WingetUpgradeText)
+    $items = ConvertFrom-WingetTableText -OutputLines (Get-WingetText -Arguments @('upgrade'))
     if ($Source) {
         $items = $items | Where-Object { $_.Source -eq $Source }
     }
     return $items
+}
+
+function Get-PackageScopeMap {
+    # Returns a hashtable Id -> 'user' | 'machine', built from
+    # `winget list --scope user` and `winget list --scope machine`.
+    # IDs found in both scopes are treated as 'machine' (the machine copy needs
+    # elevation). IDs found in neither are absent from the map ('unknown').
+    $map = @{}
+
+    foreach ($scope in 'user', 'machine') {
+        $lines = Get-WingetText -Arguments @('list', '--scope', $scope, '--accept-source-agreements')
+        $items = ConvertFrom-WingetTableText -OutputLines $lines
+        if (@($items).Count -eq 0) {
+            Write-Host "  Warning: 'winget list --scope $scope' returned no parsable packages." -ForegroundColor Yellow
+        }
+        foreach ($item in $items) {
+            if ($scope -eq 'machine' -or -not $map.ContainsKey($item.Id)) {
+                $map[$item.Id] = $scope
+            }
+        }
+    }
+
+    return $map
+}
+
+function Get-PackageScope {
+    param ([hashtable] $ScopeMap, [string] $Id)
+    if ($ScopeMap.ContainsKey($Id)) { return $ScopeMap[$Id] }
+    return 'unknown'
 }
 
 function Get-CleanLines {
@@ -283,6 +352,158 @@ function Invoke-Upgrade {
     return 'Succeeded'
 }
 
+function Close-ConsoleLine {
+    # winget's progress rendering can leave the cursor mid-line; close that
+    # line first so the separator below is actually blank.
+    try {
+        if ($Host.UI.RawUI.CursorPosition.X -gt 0) { Write-Host "" }
+    } catch {}
+    Write-Host ""
+}
+
+function New-BatchContext {
+    # Temp files and child argument list shared by both child-run launchers.
+    param ([string[]] $Ids)
+
+    $token = [guid]::NewGuid().ToString('N')
+    $ctx = @{
+        List   = Join-Path $env:TEMP "winget_batch_$token.txt"
+        Result = Join-Path $env:TEMP "winget_result_$token.txt"
+        Pid    = Join-Path $env:TEMP "winget_pid_$token.txt"
+    }
+    $Ids | Set-Content -Path $ctx.List -Encoding UTF8
+
+    $childArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', ('"{0}"' -f $PSCommandPath),
+        '_batch',
+        '-listPath',   ('"{0}"' -f $ctx.List),
+        '-resultPath', ('"{0}"' -f $ctx.Result),
+        '-pidPath',    ('"{0}"' -f $ctx.Pid),
+        '-logPath',    ('"{0}"' -f $logPath)
+    )
+    if ($Interactive) { $childArgs += '-Interactive' }
+    $ctx.Args    = $childArgs
+    $ctx.HostExe = (Get-Process -Id $PID).Path
+    return $ctx
+}
+
+function Remove-BatchContext {
+    param ([hashtable] $Ctx)
+    foreach ($f in $Ctx.List, $Ctx.Result, $Ctx.Pid) {
+        if ($f -and (Test-Path $f)) { Remove-Item -Path $f -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Read-BatchResult {
+    # Merge the child's "Id<TAB>Status" lines into a hashtable; anything the
+    # child did not report is a failure (child crashed, was killed, etc.).
+    param ([hashtable] $Ctx, [string[]] $Ids, [string] $Kind, [string] $Detail)
+
+    $statuses = @{}
+    if (Test-Path $Ctx.Result) {
+        foreach ($line in Get-Content -Path $Ctx.Result -Encoding UTF8) {
+            $parts = $line -split "`t", 2
+            if ($parts.Count -ne 2) { continue }
+            if ($parts[0] -eq '#elevated') {
+                $childElevated = [bool]::Parse($parts[1])
+                if ($childElevated -ne ($Kind -eq 'elevated')) {
+                    Write-Host ("  Warning: {0} child ran with elevated={1}." -f $Kind, $childElevated) -ForegroundColor Yellow
+                }
+                continue
+            }
+            $statuses[$parts[0]] = $parts[1]
+        }
+    }
+    foreach ($id in $Ids) {
+        if (-not $statuses.ContainsKey($id)) {
+            $message = "$Kind run returned no result for '$id'$Detail."
+            Write-Host "  $message" -ForegroundColor Red
+            Write-Log $message
+            $statuses[$id] = 'Failed'
+        }
+    }
+    return $statuses
+}
+
+function Invoke-ElevatedBatch {
+    # Upgrade the given machine-scope IDs in ONE elevated child run of this
+    # script (single UAC prompt). Returns a hashtable Id -> status.
+    param ([string[]] $Ids)
+
+    if (-not $Ids -or @($Ids).Count -eq 0) { return @{} }
+    $ctx = New-BatchContext -Ids $Ids
+    try {
+        Write-Host ("Elevating once for {0} machine-scope package(s)..." -f @($Ids).Count)
+        try {
+            $proc = Start-Process -FilePath $ctx.HostExe -ArgumentList $ctx.Args `
+                -Verb RunAs -Wait -PassThru
+        }
+        catch {
+            # UAC declined or elevation otherwise failed.
+            $message = "Elevation declined or failed; machine-scope packages were not upgraded ($($_.Exception.Message))."
+            Write-Host "  $message" -ForegroundColor Red
+            Write-Log $message
+            $statuses = @{}
+            foreach ($id in $Ids) { $statuses[$id] = 'Failed' }
+            return $statuses
+        }
+        return Read-BatchResult -Ctx $ctx -Ids $Ids -Kind 'elevated' -Detail " (child exit code $($proc.ExitCode))"
+    }
+    finally {
+        Remove-BatchContext -Ctx $ctx
+    }
+}
+
+function Invoke-DeElevatedBatch {
+    # Upgrade the given user-scope IDs in ONE non-elevated child run of this
+    # script, launched from an elevated parent via the desktop shell (Explorer),
+    # which runs at the user's normal medium integrity level. No prompt.
+    # (The linked-token/CreateProcessWithTokenW route is not usable without
+    # SeTcbPrivilege; ShellExecute through the desktop is the reliable one.)
+    # ShellExecute returns no handle, so the child writes its PID on start-up
+    # and we wait on that process. Returns a hashtable Id -> status.
+    param ([string[]] $Ids)
+
+    if (-not $Ids -or @($Ids).Count -eq 0) { return @{} }
+    $ctx = New-BatchContext -Ids $Ids
+    try {
+        Write-Host ("De-elevating once for {0} user-scope/unknown package(s)..." -f @($Ids).Count)
+        try {
+            $shellWindows = [Activator]::CreateInstance([type]::GetTypeFromCLSID('9BA05972-F6A8-11CF-A442-00A0C90A8F39'))
+            $desktopShell = $shellWindows.Item().Document.Application
+            $desktopShell.ShellExecute($ctx.HostExe, ($ctx.Args -join ' '), '', 'open', 1)
+        }
+        catch {
+            $message = "Could not start the non-elevated child (is Explorer running?): $($_.Exception.Message)"
+            Write-Host "  $message" -ForegroundColor Red
+            Write-Log $message
+            $statuses = @{}
+            foreach ($id in $Ids) { $statuses[$id] = 'Failed' }
+            return $statuses
+        }
+
+        # Wait for the child to announce itself, then for it to finish.
+        $deadline = (Get-Date).AddSeconds(60)
+        $childPid = $null
+        while (-not $childPid -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path $ctx.Pid) {
+                $raw = (Get-Content -Path $ctx.Pid -ErrorAction SilentlyContinue | Select-Object -First 1)
+                if ($raw -match '^\d+$') { $childPid = [int]$raw }
+            }
+        }
+        if (-not $childPid) {
+            return Read-BatchResult -Ctx $ctx -Ids $Ids -Kind 'de-elevated' -Detail ' (child never started)'
+        }
+        try { Wait-Process -Id $childPid -ErrorAction Stop } catch {}   # already exited is fine
+        return Read-BatchResult -Ctx $ctx -Ids $Ids -Kind 'de-elevated' -Detail ''
+    }
+    finally {
+        Remove-BatchContext -Ctx $ctx
+    }
+}
+
 function Invoke-UpgradeSet {
     param ([string[]] $Ids)
 
@@ -291,18 +512,75 @@ function Invoke-UpgradeSet {
         return
     }
 
+    $elevated = Test-Elevated
+
+    Write-Host "Determining install scope of packages..."
+    $scopeMap = Get-PackageScopeMap
+
+    $userIds    = @()   # user-scope + unknown: run in-process, never elevated
+    $machineIds = @()   # machine-scope: elevated pass
+    foreach ($id in $Ids) {
+        if ((Get-PackageScope -ScopeMap $scopeMap -Id $id) -eq 'machine') { $machineIds += $id }
+        else                                                              { $userIds    += $id }
+    }
+
     $tally = @{ Succeeded = 0; Failed = 0; Skipped = 0 }
 
-    foreach ($id in $Ids) {
-        $status = Invoke-Upgrade -Id $id -Interactive:$Interactive -DryRun:$WhatIf
-        $tally[$status]++
-        # winget's progress rendering can leave the cursor mid-line; close
-        # that line first so the separator below is actually blank.
-        try {
-            if ($Host.UI.RawUI.CursorPosition.X -gt 0) { Write-Host "" }
-        } catch {}
+    if ($WhatIf) {
         Write-Host ""
+        Write-Host ("[WhatIf] Non-elevated pass ({0}):" -f $userIds.Count)
+        foreach ($id in $userIds) {
+            Write-Host ("  {0}  [{1}]" -f $id, (Get-PackageScope -ScopeMap $scopeMap -Id $id))
+        }
+        Write-Host ("[WhatIf] Elevated pass ({0}):" -f $machineIds.Count)
+        foreach ($id in $machineIds) { Write-Host "  $id  [machine]" }
+        Write-Host ""
+        Write-Host ("Summary: 0 succeeded, 0 failed, {0} skipped." -f $Ids.Count)
+        return
     }
+
+    # ---- Pass 1: user-scope / unknown (must NOT run elevated) ----
+    if ($userIds.Count -gt 0) {
+        Write-Host ""
+        if ($elevated) {
+            $statuses = Invoke-DeElevatedBatch -Ids $userIds
+            foreach ($id in $userIds) {
+                $status = $statuses[$id]
+                Write-Host ("  {0}: {1}" -f $status, $id)
+                $tally[$status]++
+            }
+        }
+        else {
+            Write-Host ("Non-elevated pass: {0} package(s)" -f $userIds.Count)
+            foreach ($id in $userIds) {
+                $status = Invoke-Upgrade -Id $id -Interactive:$Interactive
+                $tally[$status]++
+                Close-ConsoleLine
+            }
+        }
+    }
+
+    # ---- Pass 2: machine-scope (must run elevated) ----
+    if ($machineIds.Count -gt 0) {
+        Write-Host ""
+        if ($elevated) {
+            Write-Host ("Elevated pass: {0} package(s)" -f $machineIds.Count)
+            foreach ($id in $machineIds) {
+                $status = Invoke-Upgrade -Id $id -Interactive:$Interactive
+                $tally[$status]++
+                Close-ConsoleLine
+            }
+        }
+        else {
+            $statuses = Invoke-ElevatedBatch -Ids $machineIds
+            foreach ($id in $machineIds) {
+                $status = $statuses[$id]
+                Write-Host ("  {0}: {1}" -f $status, $id)
+                $tally[$status]++
+            }
+        }
+    }
+    Write-Host ""
 
     Write-Host ("Summary: {0} succeeded, {1} failed, {2} skipped." -f `
         $tally.Succeeded, $tally.Failed, $tally.Skipped)
@@ -312,12 +590,40 @@ function Invoke-UpgradeSet {
     }
 }
 
+function Invoke-BatchChild {
+    # Runs inside a child (elevated or de-elevated): announce PID, upgrade every
+    # ID in $listPath, write "Id<TAB>Status" lines to $resultPath after each
+    # package (so a crash mid-way still reports the ones done). Failures are
+    # logged here (the child has the exit codes); the parent only tallies.
+    if (-not $resultPath) {
+        Write-Host "_batch requires -resultPath." -ForegroundColor Red
+        exit 2
+    }
+    if ($pidPath) { Set-Content -Path $pidPath -Value $PID -Encoding ASCII }
+
+    $elevated = Test-Elevated
+    Write-Host ("Child run (elevated={0}): upgrading from {1}" -f $elevated, $listPath)
+    "#elevated`t$elevated" | Set-Content -Path $resultPath -Encoding UTF8
+
+    $ids = @(Get-CleanLines -Path $listPath)
+    foreach ($id in $ids) {
+        $status = Invoke-Upgrade -Id $id -Interactive:$Interactive
+        "{0}`t{1}" -f $id, $status | Add-Content -Path $resultPath -Encoding UTF8
+        Close-ConsoleLine
+    }
+}
+
 function Show-Usage {
     Write-Host "Usage:"
     Write-Host "  .\WingetUpgradeAll.ps1 <list|save|upgrade|upgrade-all> [options]"
     Write-Host ""
+    Write-Host "Scope-aware: machine-scope packages are upgraded elevated, user-scope"
+    Write-Host "packages non-elevated, whichever kind of terminal you start from."
+    Write-Host "(Elevated terminal: user-scope runs in a de-elevated child, no prompt."
+    Write-Host " Normal terminal: machine-scope runs in one elevated child, one UAC prompt.)"
+    Write-Host ""
     Write-Host "Commands:"
-    Write-Host "  list         Lists all upgradeable programs."
+    Write-Host "  list         Lists all upgradeable programs with install scope."
     Write-Host "  save         Saves upgradeable program IDs to a file, excluding exceptions."
     Write-Host "  upgrade      Upgrades programs from the saved list, excluding exceptions."
     Write-Host "  upgrade-all  Lists live and upgrades everything, excluding exceptions."
@@ -328,7 +634,7 @@ function Show-Usage {
     Write-Host "  -logPath <path>         Error log.                Default: $logPath"
     Write-Host "  -Source <winget|msstore>  Restrict to one source."
     Write-Host "  -Interactive            Upgrade interactively instead of silently."
-    Write-Host "  -WhatIf                 Show what would be upgraded without doing it."
+    Write-Host "  -WhatIf                 Show what would be upgraded (and in which pass) without doing it."
 }
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +652,17 @@ if (-not (Test-WingetInstalled)) {
     exit 1
 }
 
+if ($command -eq '_batch') {
+    try {
+        Invoke-BatchChild
+    }
+    catch {
+        Write-Log "Batch child error: $($_.Exception.Message)"
+        exit 1
+    }
+    exit 0
+}
+
 try {
     $exceptions = Get-CleanLines -Path $exceptionsPath
 
@@ -357,7 +674,11 @@ try {
                 Write-Host "No upgrades available."
                 break
             }
-            $items | Format-Table Name, Id, Version, Available, Source -AutoSize
+            $scopeMap = Get-PackageScopeMap
+            $items |
+                Select-Object Name, Id, Version, Available, Source,
+                    @{ Name = 'Scope'; Expression = { Get-PackageScope -ScopeMap $scopeMap -Id $_.Id } } |
+                Format-Table Name, Id, Version, Available, Source, Scope -AutoSize
             Write-Host ("{0} upgrade(s) available." -f @($items).Count)
         }
 

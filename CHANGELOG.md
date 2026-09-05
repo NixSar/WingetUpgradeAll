@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-09-05
+
+### Added
+- Scope-aware upgrades. Each package's install scope is determined via `winget list --scope user|machine`. Every package is upgraded under the right token regardless of how the script was started: from an elevated terminal, machine-scope packages run in-process and user-scope/unknown packages run in one de-elevated child (launched via the desktop shell, no prompt); from a normal terminal, user-scope packages run in-process and machine-scope packages run in one elevated child (one UAC prompt). Child results are merged into the summary and error log.
+- `list` shows a `Scope` column; `-WhatIf` shows the non-elevated / elevated partition.
+- Internal `_batch` command with `-resultPath` / `-pidPath` parameters used by the child runs.
+
+### Changed
+- `ConvertFrom-WingetUpgradeText` generalised to `ConvertFrom-WingetTableText` (also parses `winget list`); `Get-WingetUpgradeText` generalised to `Get-WingetText -Arguments`.
+
+### Why
+- Running per-user installers (Electron/Squirrel apps) under an elevated token makes them write Administrators-owned keys with wrong permissions into the user hive. On 2026-05-31 this left `HKCU\Software\Classes\.webp` unwritable by the user, which made Claude Desktop's MSIX auto-update fail registration (`0x80073CF6`) and loop, force-closing the app repeatedly.
+
 ## [2.0.5] - 2026-06-10
 
 ### Fixed

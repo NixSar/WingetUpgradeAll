@@ -10,6 +10,22 @@
 
 When the [`Microsoft.WinGet.Client`](https://www.powershellgallery.com/packages/Microsoft.WinGet.Client) PowerShell module is installed, the script uses it to enumerate upgradeable packages — this is robust and locale-independent. Otherwise it falls back to parsing `winget upgrade` text output. The upgrades themselves always run through the `winget` CLI, and failures are detected via the process exit code (not exceptions).
 
+## Elevation and install scope (important)
+
+Per-user packages (anything installed under your profile — Electron/Squirrel apps such as Canva, Discord, Slack, Obsidian, VS Code user setup…) must never be upgraded from an elevated process. Their installers then run with an elevated token and write into *your* registry hive with the wrong owner and permissions. That silently corrupts per-user keys (file associations, `HKCU\Software\Classes\...`) and can break unrelated installers later — for example MSIX/Store app updates failing with `0x80073CF6 / Access is denied`.
+
+Since 2.1 the script is scope-aware and runs every package under the right token, whichever kind of terminal you start it from:
+
+1. It asks winget for the install scope of every package (`winget list --scope user` / `--scope machine`). Packages winget cannot classify are treated as user-scope.
+2. **Started from an elevated terminal:** machine-scope packages upgrade in-process. User-scope packages run in **one de-elevated child run** of the script, launched through the desktop shell so it gets your normal (medium-integrity) token. No prompt.
+3. **Started from a normal terminal:** user-scope packages upgrade in-process. Machine-scope packages run in **one elevated child run** — a single UAC prompt per run.
+
+Child runs open in their own console window; their per-package results are merged into the parent's summary, and failures go to the same error log.
+
+`-WhatIf` shows which packages would go in which pass. `list` shows a `Scope` column.
+
+Limitations: the de-elevated child needs the Explorer desktop to be running (it always is in a normal session). If the child cannot be started, the affected packages are reported as failed rather than being upgraded elevated.
+
 ## Requirements
 - **Windows** with the **Windows Package Manager (`winget`)** installed (ships with *App Installer* from the Microsoft Store).
 - **PowerShell 5.1** or later (PowerShell 7+ recommended).
@@ -34,7 +50,7 @@ The command is a positional value — type it directly (e.g. `.\WingetUpgradeAll
 ### Commands
 | Command | Description |
 | --- | --- |
-| `list` | Lists all upgradeable programs. |
+| `list` | Lists all upgradeable programs with their install scope. |
 | `save` | Saves upgradeable program IDs to a file, excluding exceptions. |
 | `upgrade` | Upgrades programs from the saved list, excluding exceptions. |
 | `upgrade-all` | Lists live and upgrades everything, excluding exceptions. |
@@ -47,7 +63,7 @@ The command is a positional value — type it directly (e.g. `.\WingetUpgradeAll
 | `-logPath <path>` | Error log file. | `$PSScriptRoot\WingetUpgradeErrors.log` |
 | `-Source <winget\|msstore>` | Restrict to a single winget source. | *(all sources)* |
 | `-Interactive` | Run upgrades interactively instead of silently. | *(silent)* |
-| `-WhatIf` | Show what would be upgraded without performing any upgrades. | *(off)* |
+| `-WhatIf` | Show what would be upgraded, and in which pass (non-elevated / elevated), without performing any upgrades. | *(off)* |
 
 ## The save → upgrade workflow
 `save` and `upgrade` are two halves of one workflow:
@@ -91,6 +107,7 @@ Notepad++.Notepad++
 ```
 
 ## Notes
+- From a normal terminal expect one UAC prompt per run for the machine-scope batch; declining it marks those packages as failed. From an elevated terminal there is no prompt.
 - Upgrades run silently by default with package and source agreements accepted; use `-Interactive` to override.
 - The script logs errors to `WingetUpgradeErrors.log` in the script directory (configurable via `-logPath`).
 - It exits with code `1` if any upgrade fails, winget is missing, or the saved list can't be found — useful for Task Scheduler / CI.
